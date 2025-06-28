@@ -1,13 +1,16 @@
 import streamlit as st
 import subprocess
+import os
+from populate_db import main as populate_db
 from langchain.vectorstores.chroma import Chroma
 from langchain.prompts import ChatPromptTemplate
 from langchain_community.llms.ollama import Ollama
 
 from get_embedding_function import get_embedding_function
 
-CHROMA_PATH = "chroma"
-PROMPT_TEMPLATE = """
+# Constants
+CHROMA_PATH = "chroma_db"
+BASE_PROMPT = """
 Answer the question based only on the following context:
 
 {context}
@@ -16,74 +19,93 @@ Answer the question based only on the following context:
 
 Answer the question based on the above context: {question}
 """
+PERSONAS = {
+    "Concise": "Answer briefly and to the point.",
+    "Detailed": "Provide a comprehensive, detailed answer.",
+    "Expert": "Answer as an expert with advanced insights."
+}
 
-# Helper to list Ollama models via CLI\ n@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def get_available_models():
-    """Run `ollama ls` and return a list of model names."""
+    """List installed Ollama models via CLI."""
     try:
         result = subprocess.run(["ollama", "ls"], capture_output=True, text=True, check=True)
-        lines = [line for line in result.stdout.splitlines() if line.strip()]
-        # Drop header line if it starts with 'NAME'
+        lines = [l for l in result.stdout.splitlines() if l.strip()]
         if lines and lines[0].upper().startswith("NAME"):
             lines = lines[1:]
-        # Each line begins with the model name
-        models = [line.split()[0] for line in lines]
-        return models
+        return [line.split()[0] for line in lines]
     except Exception as e:
         st.warning(f"Could not list Ollama models: {e}")
         return []
 
-# Initialize session state for chat history
+# Initialize session
 if "history" not in st.session_state:
     st.session_state.history = []
 
 st.set_page_config(page_title="RAG Chatbot", page_icon="🤖")
 st.title("🔍 RAG Chatbot with Streamlit")
 
-# Sidebar controls
+# Sidebar: Upload & Settings
 with st.sidebar:
-    st.header("Configuration")
-    k = st.slider("Number of context chunks (k)", min_value=1, max_value=10, value=5)
-    model_options = get_available_models() or ["deepseek-r1:8b"]
-    model_name = st.selectbox("Ollama Model", model_options)
-    if st.button("Clear chat history"):
+    st.header("Upload Documents")
+    uploaded = st.file_uploader("Upload PDF files", type=["pdf"], accept_multiple_files=True)
+    if uploaded:
+        os.makedirs("data", exist_ok=True)
+        for f in uploaded:
+            with open(os.path.join("data", f.name), "wb") as out:
+                out.write(f.getbuffer())
+        populate_db()
+        st.success("Documents uploaded and indexed.")
+
+    st.markdown("---")
+    st.header("Settings")
+    persona = st.selectbox("Response Persona", list(PERSONAS.keys()))
+    k = st.slider("Context chunks (k)", 1, 10, 5)
+    model_opts = get_available_models() or ["deepseek-r1:8b"]
+    model_name = st.selectbox("Ollama Model", model_opts)
+    if st.button("Clear History"):
         st.session_state.history = []
         st.experimental_rerun()
 
-# Display past chat history
+# Display chat history
 for msg in st.session_state.history:
     st.chat_message(msg["role"]).write(msg["content"])
 
 # User input
 query = st.chat_input("Ask a question...")
-
 if query:
-    # Show user message immediately
+    # Echo user
     st.chat_message("user").write(query)
     st.session_state.history.append({"role": "user", "content": query})
-    
-    # Placeholder for assistant message
-    assistant_msg = st.chat_message("assistant")
-    with st.spinner("Thinking..."):
-        # Prepare database and embeddings
-        embedding_function = get_embedding_function()
-        db = Chroma(persist_directory=CHROMA_PATH, embedding_function=embedding_function)
-        results = db.similarity_search_with_score(query, k=k)
-        
-        context_text = "\n\n---\n\n".join([doc.page_content for doc, _ in results])
-        
-        # Format prompt
-        prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-        prompt = prompt_template.format(context=context_text, question=query)
-        
-        # Invoke LLM
-        model = Ollama(model=model_name)
-        reply = model.invoke(prompt)
 
-    # Write assistant reply
-    assistant_msg.write(reply)
+    # Retrieval
+    embedding_fn = get_embedding_function()
+    db = Chroma(persist_directory=CHROMA_PATH, embedding_function=embedding_fn)
+    try:
+        results = db.similarity_search_with_score(query, k=k)
+    except Exception:
+        st.warning("No documents in the vector store—upload & index PDFs first.")
+        st.stop()
+    if not results:
+        st.warning("No matching chunks found.")
+        st.stop()
+
+    context_text = "\n\n---\n\n".join([doc.page_content for doc, _ in results])
+
+    # Build prompt
+    prompt_text = PERSONAS[persona] + "\n" + BASE_PROMPT
+    prompt_template = ChatPromptTemplate.from_template(prompt_text)
+    prompt = prompt_template.format(context=context_text, question=query)
+
+    # LLM call (non-streaming)
+    model = Ollama(model=model_name)
+    reply = model.invoke(prompt)
+    st.chat_message("assistant").write(reply)
     st.session_state.history.append({"role": "assistant", "content": reply})
 
-# Footer
-st.markdown("---")
-st.markdown("Built with [Streamlit](https://streamlit.io/) and LangChain.")
+    # Show sources
+    st.markdown("**Sources & Context Snippets:**")
+    for doc, score in results:
+        sid = doc.metadata.get("id", "unknown")
+        with st.expander(f"Source: {sid} (score: {score:.3f})"):
+            st.write(doc.page_content)
