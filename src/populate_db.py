@@ -5,8 +5,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings.ollama import  OllamaEmbeddings
 from langchain_community.vectorstores.chroma import Chroma
 from get_embedding_function import get_embedding_function
-DATA_PATH = "data"
-CHROMA_PATH = "chroma_db"
+from config import CHROMA_PATH, DATA_PATH
 
 def load_documents():
     document_loader = PyPDFDirectoryLoader(DATA_PATH)
